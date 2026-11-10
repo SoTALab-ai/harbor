@@ -97,18 +97,16 @@ def check_command(
         "--prompt",
         help="Prompt file for the evaluator agent. Uses built-in default if not specified.",
     ),
-    agent: str = typer.Option("claude-code", "-a", "--agent", help="Agent to use"),
-    model: str = typer.Option(
-        "claude-sonnet-4-6", "-m", "--model", help="Model to use"
-    ),
+    agent: str | None = typer.Option(None, "-a", "--agent", help="Agent to use"),
+    model: str | None = typer.Option(None, "-m", "--model", help="Model to use"),
     agent_kwargs: list[str] | None = typer.Option(
         None, "--ak", "--agent-kwarg", help="Agent kwarg key=value (repeatable)"
     ),
     agent_env: list[str] | None = typer.Option(
         None, "--ae", "--agent-env", help="Env var KEY=VALUE for the agent (repeatable)"
     ),
-    environment: EnvironmentType = typer.Option(
-        EnvironmentType.DOCKER,
+    environment: EnvironmentType | None = typer.Option(
+        None,
         "-e",
         "--env",
         help="Environment type to run the check in (e.g. docker, daytona).",
@@ -144,6 +142,11 @@ def check_command(
     config: Path | None = typer.Option(
         None, "-c", "--config", help="Base JobConfig (YAML/JSON) for advanced settings"
     ),
+    environment_config: Path | None = typer.Option(
+        None,
+        "--environment-config",
+        help="JSON CheckEnvironmentConfig for the review sandbox and separate verifier.",
+    ),
     quiet: bool = typer.Option(False, "-q", "--quiet", help="Suppress trial progress"),
 ):
     """Check task quality against a rubric.
@@ -176,6 +179,7 @@ def check_command(
                 exclude_task_names=exclude_task_names,
                 n_tasks=n_tasks,
                 config_path=config,
+                environment_config_path=environment_config,
                 quiet=quiet,
             )
         )

@@ -10,12 +10,16 @@ produced.
 import json
 import shutil
 import tempfile
-import tomllib
 from collections import defaultdict
 from fnmatch import fnmatch
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+import toml
+import tomllib
+from pydantic import BaseModel, ConfigDict
+
+import harbor.analyze
 from harbor.analyze.models import (
     QualityCheckResult,
     Rubric,
@@ -25,11 +29,10 @@ from harbor.analyze.models import (
 )
 from harbor.cli.quality_checker.models import CheckReport
 from harbor.models.environment_type import EnvironmentType
+from harbor.models.task.config import EnvironmentConfig as TaskEnvironment
 from harbor.models.task.paths import TaskPaths
 from harbor.models.task.task import Task
 from harbor.models.trial.paths import TrialPaths
-
-import harbor.analyze
 
 PROMPTS_DIR = Path(harbor.analyze.__file__).parent / "prompts"
 CHECK_TASK_TEMPLATE_DIR = Path(harbor.analyze.__file__).parent / "check-task-template"
@@ -37,13 +40,32 @@ CHECK_TASK_TEMPLATE_DIR = Path(harbor.analyze.__file__).parent / "check-task-tem
 RESULT_FILENAME = "check-result.json"
 
 
+class CheckEnvironmentConfig(BaseModel):
+    """审查沙箱资源；不修改任务内容、报告协议或原生校验器。"""
+
+    model_config = ConfigDict(extra="forbid")
+    environment: TaskEnvironment
+    verifier_environment: TaskEnvironment | None = None
+
+    def apply(self, path: Path) -> None:
+        config = tomllib.loads(path.read_text())
+        config["environment"] = self.environment.model_dump(
+            mode="json", exclude_none=True
+        )
+        if self.verifier_environment is not None:
+            config["verifier"]["environment"] = self.verifier_environment.model_dump(
+                mode="json", exclude_none=True
+            )
+        path.write_text(toml.dumps(config))
+
+
 async def run_checks(
     path: Path,
-    agent: str = "claude-code",
-    model: str = "claude-sonnet-4-6",
+    agent: str | None = None,
+    model: str | None = None,
     rubric_path: Path | None = None,
     prompt_path: Path | None = None,
-    environment: EnvironmentType = EnvironmentType.DOCKER,
+    environment: EnvironmentType | None = None,
     n_concurrent: int = 4,
     n_attempts: int = 1,
     job_name: str | None = None,
@@ -55,6 +77,7 @@ async def run_checks(
     exclude_task_names: list[str] | None = None,
     n_tasks: int | None = None,
     config_path: Path | None = None,
+    environment_config_path: Path | None = None,
     quiet: bool = False,
 ) -> tuple[CheckReport, Path]:
     """Check a task directory (or a directory of task directories) as a Harbor job.
@@ -77,6 +100,11 @@ async def run_checks(
         else (PROMPTS_DIR / "check.txt").read_text()
     )
 
+    review_environment = (
+        CheckEnvironmentConfig.model_validate_json(environment_config_path.read_text())
+        if environment_config_path
+        else None
+    )
     tmp = Path(tempfile.mkdtemp(prefix="harbor-check-"))
     try:
         task_name_by_wrapper: dict[str, str] = {}
@@ -88,6 +116,7 @@ async def run_checks(
                 template=template,
                 output_schema=response_model.model_json_schema(),
                 dest=tmp / f"check-{task_dir.resolve().name}",
+                environment_config=review_environment,
             )
             wrappers.append(wrapper)
             task_name_by_wrapper[str(wrapper.resolve())] = task_dir.name
@@ -147,6 +176,7 @@ def assemble_check_task(
     template: str,
     output_schema: dict[str, Any],
     dest: Path,
+    environment_config: CheckEnvironmentConfig | None = None,
 ) -> Path:
     """Assemble the wrapper task: a prebuilt-image task (no Dockerfile) that
     uploads the task under review to the workdir and validates the agent's result.
@@ -173,6 +203,8 @@ def assemble_check_task(
         json.dumps([c.name for c in rubric.criteria], indent=2)
     )
     shutil.copy(template_paths.config_path, paths.config_path)
+    if environment_config is not None:
+        environment_config.apply(paths.config_path)
 
     workdir = (
         tomllib.loads(paths.config_path.read_text())
@@ -211,9 +243,9 @@ async def _run_check_job(
     wrappers: list[Path],
     task_name_by_wrapper: dict[str, str],
     response_model,
-    agent: str,
-    model: str,
-    environment: EnvironmentType,
+    agent: str | None,
+    model: str | None,
+    environment: EnvironmentType | None,
     n_concurrent: int,
     n_attempts: int,
     job_name: str | None,
@@ -236,17 +268,30 @@ async def _run_check_job(
     config.n_concurrent_trials = n_concurrent
     config.n_attempts = n_attempts
     config.quiet = quiet
-    config.agents = [
-        AgentConfig(
-            name=agent,
-            model_name=model,
-            kwargs=agent_kwargs or {},
-            env=agent_env or {},
-        )
-    ]
-    config.environment = EnvironmentConfig(
-        type=environment, kwargs=environment_kwargs or {}
-    )
+    if config_path is None:
+        config.agents = [
+            AgentConfig(name="claude-code", model_name="claude-sonnet-4-6")
+        ]
+        config.environment = EnvironmentConfig(type=EnvironmentType.DOCKER)
+    for configured_agent in config.agents:
+        if configured_agent.name is None and configured_agent.import_path is None:
+            configured_agent.name = "claude-code"
+            configured_agent.model_name = (
+                configured_agent.model_name or "claude-sonnet-4-6"
+            )
+        if agent is not None:
+            configured_agent.name = agent
+            configured_agent.import_path = None
+        if model is not None:
+            configured_agent.model_name = model
+        configured_agent.kwargs.update(agent_kwargs or {})
+        configured_agent.env.update(agent_env or {})
+    if environment is not None:
+        config.environment.type = environment
+        config.environment.import_path = None
+    if config.environment.type is None and config.environment.import_path is None:
+        config.environment.type = EnvironmentType.DOCKER
+    config.environment.kwargs.update(environment_kwargs or {})
     config.tasks = [TaskConfig(path=w) for w in wrappers]
     config.datasets = []
 
